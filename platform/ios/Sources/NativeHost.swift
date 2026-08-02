@@ -2,6 +2,188 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
+// MARK: - Back-deployment shims
+//
+// The deployment target is iOS 15.0 so that TrollStore devices (iOS 14.0-17.0)
+// are supported. Anything newer than iOS 15 has to be behind `#available`,
+// including types like NavigationStack that would otherwise fail to resolve
+// when the process starts.
+
+/// `NavigationStack` on iOS 16+, `NavigationView` in stack style on iOS 15.
+private struct NavigationContainer<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        if #available(iOS 16.0, *) {
+            NavigationStack(root: content)
+        } else {
+            NavigationView(content: content)
+                .navigationViewStyle(.stack)
+        }
+    }
+}
+
+/// `ContentUnavailableView` on iOS 17+, a hand-rolled equivalent on iOS 15/16.
+private struct EmptyLibraryPlaceholder: View {
+    private let title = "No Games Yet"
+    private let message = "Import a 32-bit iPhone game to add it to your library."
+
+    var body: some View {
+        if #available(iOS 17.0, *) {
+            ContentUnavailableView {
+                Label(title, systemImage: "gamecontroller")
+            } description: {
+                Text(message)
+            }
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "gamecontroller")
+                    .font(.system(size: 46, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 40)
+        }
+    }
+}
+
+private var iOS16OrLater: Bool {
+    if #available(iOS 16.0, *) { return true }
+    return false
+}
+
+/// UIKit rotation, which on iOS 16+ is driven by `requestGeometryUpdate` and
+/// `setNeedsUpdateOfSupportedInterfaceOrientations`. Neither exists on iOS 15,
+/// so there we set the device orientation and re-ask UIKit to rotate.
+@MainActor
+private func touchHLEApplyOrientation(
+    _ mask: UIInterfaceOrientationMask,
+    viewController: UIViewController?,
+    scene: UIWindowScene?
+) {
+    if #available(iOS 16.0, *) {
+        viewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        scene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+    } else {
+        // UIDevice.orientation is read-only in the public API; UIKit backs it
+        // with a setter that KVC can reach. Check before poking it so a future
+        // OS that drops the setter degrades instead of raising.
+        let device = UIDevice.current
+        if let deviceOrientation = touchHLEDeviceOrientation(for: mask),
+           device.responds(to: NSSelectorFromString("setOrientation:")) {
+            device.setValue(deviceOrientation.rawValue, forKey: "orientation")
+        }
+        UIViewController.attemptRotationToDeviceOrientation()
+    }
+}
+
+/// Interface and device orientations are mirrored for the landscape cases.
+private func touchHLEDeviceOrientation(
+    for mask: UIInterfaceOrientationMask
+) -> UIDeviceOrientation? {
+    if mask.contains(.landscapeLeft) { return .landscapeRight }
+    if mask.contains(.landscapeRight) { return .landscapeLeft }
+    if mask.contains(.portrait) { return .portrait }
+    return nil
+}
+
+private extension View {
+    /// `onChange(of:)` without tripping the iOS 17 two-parameter signature,
+    /// which does not exist on iOS 15/16.
+    @ViewBuilder
+    func touchHLEOnChange<Value: Equatable>(
+        of value: Value,
+        perform action: @escaping (Value) -> Void
+    ) -> some View {
+        if #available(iOS 17.0, *) {
+            onChange(of: value) { _, newValue in action(newValue) }
+        } else {
+            onChange(of: value, perform: action)
+        }
+    }
+}
+
+// MARK: - JIT
+
+/// Whether the process can currently get writable-executable memory, which
+/// Dynarmic requires. TrollStore grants this permanently via the
+/// `dynamic-codesigning` entitlement; StikDebug grants it per-process by
+/// attaching a debugger, and only works on iOS 17.4+.
+@MainActor
+private final class JITStatus: ObservableObject {
+    static let shared = JITStatus()
+
+    @Published private(set) var isAvailable = touchhle_ios_jit_available()
+
+    /// StikDebug's own minimum. Below this, TrollStore is the only route.
+    nonisolated static var stikDebugSupported: Bool {
+        if #available(iOS 17.4, *) { return true }
+        return false
+    }
+
+    /// Entitlement-granted JIT survives relaunches; debugger-granted does not.
+    var isPermanent: Bool {
+        isAvailable && !touchhle_ios_jit_is_from_debugger()
+    }
+
+    /// Debugger-granted JIT dies with the process, so the handoff has to be
+    /// redone on every cold start. Auto-triggering it once per launch makes
+    /// that invisible - but only once, so a failed handoff cannot bounce the
+    /// user back and forth to TrollStore forever.
+    private(set) var hasAttemptedAutoEnable = false
+
+    func markAutoEnableAttempted() {
+        hasAttemptedAutoEnable = true
+    }
+
+    /// Re-probe: a debugger can attach after the app has already started.
+    func refresh() {
+        touchhle_ios_log_jit_status("refresh")
+        let available = touchhle_ios_jit_available()
+        if available != isAvailable {
+            isAvailable = available
+        }
+        diagnostics = JITStatus.readDiagnostics()
+    }
+
+    @Published private(set) var diagnostics: [(String, String)] = JITStatus.readDiagnostics()
+
+    static func readDiagnostics() -> [(String, String)] {
+        var raw = TouchHLEJITDiagnostics()
+        touchhle_ios_jit_diagnostics(&raw)
+        return [
+            ("CS_DEBUGGED", raw.cs_debugged ? "yes" : "no"),
+            ("cs_flags", String(format: "0x%08X", raw.cs_flags)),
+            ("csops", raw.csops_result == 0
+                ? "ok"
+                : "failed (errno \(raw.csops_errno))"),
+            ("dynamic-codesigning", raw.has_dynamic_codesigning ? "yes" : "no"),
+            // Both probes are informational only - see touchhle_ios_jit_available.
+            ("mmap RWX (not a test)", raw.mmap_rwx_ok ? "ok" : "denied"),
+            ("mprotect R+X (not a test)", raw.mprotect_exec_ok ? "ok" : "denied")
+        ]
+    }
+
+    static var unavailableMessage: String {
+        if stikDebugSupported {
+            return """
+                touchHLE needs JIT to run games. Tap the bolt button and enable it \
+                with TrollStore or StikDebug, then come back and start the game.
+                """
+        }
+        return """
+            touchHLE needs JIT to run games. Tap the bolt button to enable it with \
+            TrollStore, then come back and start the game. StikDebug is not an \
+            option here because it requires iOS 17.4 or newer.
+            """
+    }
+}
+
 private struct GameFile: Identifiable {
     let url: URL
     let displayName: String
@@ -389,11 +571,11 @@ final class TouchHLENativeHost: NSObject {
     static func restoreHostWindow() {
         guard let window = shared.window else { return }
         window.makeKeyAndVisible()
-        if #available(iOS 16.0, *) {
-            window.windowScene?.requestGeometryUpdate(
-                .iOS(interfaceOrientations: .portrait)
-            )
-        }
+        touchHLEApplyOrientation(
+            .portrait,
+            viewController: window.rootViewController,
+            scene: window.windowScene
+        )
     }
 
     @MainActor
@@ -468,14 +650,13 @@ final class TouchHLENativeHost: NSObject {
         viewController.loadViewIfNeeded()
         controlsWindow.interactiveView = viewController.exitButton
         controlsWindow.isHidden = false
-        viewController.setNeedsUpdateOfSupportedInterfaceOrientations()
         gameControlsWindow = controlsWindow
 
-        if #available(iOS 16.0, *) {
-            windowScene.requestGeometryUpdate(
-                .iOS(interfaceOrientations: launchOrientationMask)
-            )
-        }
+        touchHLEApplyOrientation(
+            launchOrientationMask,
+            viewController: viewController,
+            scene: windowScene
+        )
         waitForGameSurface(
             windowScene: windowScene,
             orientationMask: launchOrientationMask,
@@ -506,7 +687,11 @@ final class TouchHLENativeHost: NSObject {
             gameControlsWindow?.layoutIfNeeded()
             if let viewController = gameControlsWindow?.rootViewController as? GameControlsViewController {
                 viewController.allowedOrientations = orientationMask
-                viewController.setNeedsUpdateOfSupportedInterfaceOrientations()
+                touchHLEApplyOrientation(
+                    orientationMask,
+                    viewController: viewController,
+                    scene: nil
+                )
             }
             print(
                 "touchHLE game surface ready: orientation=\(windowScene.interfaceOrientation.rawValue) " +
@@ -544,6 +729,8 @@ final class TouchHLENativeHost: NSObject {
 
 private struct LibraryView: View {
     @StateObject private var library = GameLibrary()
+    @ObservedObject private var jit = JITStatus.shared
+    @State private var pendingGame: GameFile?
     @State private var showingImporter = false
     @State private var showingSettings = false
     @State private var showingAbout = false
@@ -553,20 +740,19 @@ private struct LibraryView: View {
     @AppStorage("orientation") private var orientation = 0
     @AppStorage("networkAccess") private var networkAccess = false
     @AppStorage("analogTilt") private var analogTilt = true
+    @AppStorage("autoEnableJIT") private var autoEnableJIT = true
+
+    @Environment(\.openURL) private var openURL
 
     private static let ipaType = UTType(filenameExtension: "ipa") ?? .archive
 
     var body: some View {
-        NavigationStack {
+        NavigationContainer {
             ZStack {
                 LibraryBackground()
 
                 if library.games.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Games Yet", systemImage: "gamecontroller")
-                    } description: {
-                        Text("Import a 32-bit iPhone game to add it to your library.")
-                    }
+                    EmptyLibraryPlaceholder()
                 } else {
                     ScrollView {
                         LazyVGrid(
@@ -575,13 +761,14 @@ private struct LibraryView: View {
                         ) {
                             ForEach(library.games) { game in
                                 GameCard(game: game) {
-                                    library.launch(
-                                        game,
-                                        scaleHack: scaleHack,
-                                        orientation: orientation,
-                                        networkAccess: networkAccess,
-                                        analogTilt: analogTilt
-                                    )
+                                    jit.refresh()
+                                    // Warn, but never hard-block: if detection
+                                    // is ever wrong the user can still play.
+                                    if jit.isAvailable {
+                                        launch(game)
+                                    } else {
+                                        pendingGame = game
+                                    }
                                 }
                                 .contextMenu {
                                     Button(role: .destructive) {
@@ -603,7 +790,7 @@ private struct LibraryView: View {
             }
             .navigationTitle("Library")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         showingAbout = true
                     } label: {
@@ -611,7 +798,7 @@ private struct LibraryView: View {
                     }
                 }
 
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
                     EnableJITButton()
 
                     Button {
@@ -664,6 +851,22 @@ private struct LibraryView: View {
             } message: {
                 Text(library.launchError ?? "Unknown error")
             }
+            .alert(
+                "JIT Is Not Enabled",
+                isPresented: Binding(
+                    get: { pendingGame != nil },
+                    set: { if !$0 { pendingGame = nil } }
+                )
+            ) {
+                Button("Try Anyway") {
+                    guard let game = pendingGame else { return }
+                    pendingGame = nil
+                    launch(game)
+                }
+                Button("Cancel", role: .cancel) { pendingGame = nil }
+            } message: {
+                Text(JITStatus.unavailableMessage)
+            }
             .overlay {
                 if library.isLaunching {
                     VStack(spacing: 12) {
@@ -676,11 +879,51 @@ private struct LibraryView: View {
                 }
             }
         }
-        .onChange(of: scenePhase) { _, newPhase in
+        .touchHLEOnChange(of: scenePhase) { newPhase in
             if newPhase == .active {
                 library.reload()
+                // A debugger may have attached while we were backgrounded -
+                // which is exactly what returning from TrollStore looks like.
+                jit.refresh()
+                autoEnableJITIfNeeded()
             }
         }
+    }
+
+    /// Hand off to TrollStore on launch so tapping the app icon is enough. The
+    /// round trip is visible - TrollStore comes to the foreground briefly and
+    /// bounces straight back - but it needs no interaction.
+    ///
+    /// Runs at most once per process. If the handoff does not work (TrollStore
+    /// missing, or its URL scheme switched off) nothing happens and the bolt
+    /// button remains as the manual route.
+    private func autoEnableJITIfNeeded() {
+        guard autoEnableJIT,
+              !jit.isAvailable,
+              !jit.hasAttemptedAutoEnable,
+              let provider = JITProvider.supported.first,
+              let bundleIdentifier = Bundle.main.bundleIdentifier,
+              let url = provider.url(bundleIdentifier: bundleIdentifier)
+        else {
+            return
+        }
+
+        jit.markAutoEnableAttempted()
+        // openURL is dropped if it fires while the scene is still settling
+        // into the foreground, so let the launch finish first.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            openURL(url) { _ in }
+        }
+    }
+
+    private func launch(_ game: GameFile) {
+        library.launch(
+            game,
+            scaleHack: scaleHack,
+            orientation: orientation,
+            networkAccess: networkAccess,
+            analogTilt: analogTilt
+        )
     }
 
     private func errorBinding(for error: Binding<String?>) -> Binding<Bool> {
@@ -695,42 +938,129 @@ private struct LibraryView: View {
     }
 }
 
-private struct EnableJITButton: View {
-    @Environment(\.openURL) private var openURL
-    @State private var showingUnavailableAlert = false
+/// An external app that can hand this process JIT by attaching a debugger.
+/// Both routes need `get-task-allow` and both are per-process: JIT has to be
+/// re-enabled every time touchHLE is launched fresh.
+private enum JITProvider: String, Identifiable, CaseIterable {
+    /// TrollStore 2.0.12+ "Enable JIT". Requires the URL scheme to be turned on
+    /// in TrollStore settings. This is the only route on iOS below 17.4.
+    case trollStore
+    /// StikDebug + LocalDevVPN. Requires iOS 17.4 or newer.
+    case stikDebug
 
-    var body: some View {
-        Button {
-            guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
-                showingUnavailableAlert = true
-                return
-            }
+    var id: String { rawValue }
 
-            var components = URLComponents()
+    /// Providers worth offering on the running OS version.
+    static var supported: [JITProvider] {
+        JITStatus.stikDebugSupported ? [.trollStore, .stikDebug] : [.trollStore]
+    }
+
+    var displayName: String {
+        switch self {
+        case .trollStore: return "TrollStore"
+        case .stikDebug: return "StikDebug"
+        }
+    }
+
+    func url(bundleIdentifier: String) -> URL? {
+        var components = URLComponents()
+        switch self {
+        case .trollStore:
+            components.scheme = "apple-magnifier"
+            components.host = "enable-jit"
+            components.queryItems = [
+                URLQueryItem(name: "bundle-id", value: bundleIdentifier)
+            ]
+        case .stikDebug:
             components.scheme = "stikdebug"
             components.host = "enable-jit"
             components.queryItems = [
                 URLQueryItem(name: "bundle-id", value: bundleIdentifier),
                 URLQueryItem(name: "script-name", value: "universal.js")
             ]
-            guard let url = components.url else {
-                showingUnavailableAlert = true
-                return
-            }
-
-            openURL(url) { accepted in
-                if !accepted {
-                    showingUnavailableAlert = true
-                }
-            }
-        } label: {
-            Label("Enable JIT", systemImage: "bolt.fill")
         }
-        .accessibilityHint("Opens StikDebug and enables JIT for touchHLE")
-        .alert("StikDebug Not Available", isPresented: $showingUnavailableAlert) {
+        return components.url
+    }
+
+    var unavailableMessage: String {
+        switch self {
+        case .trollStore:
+            return """
+                Open TrollStore, turn on the URL scheme in its settings, then try \
+                again. TrollStore 2.0.12 or newer is required.
+                """
+        case .stikDebug:
+            return """
+                Install and configure StikDebug, then try again. LocalDevVPN must \
+                be connected.
+                """
+        }
+    }
+}
+
+/// Hidden once JIT is actually available, so a TrollStore user who already has
+/// it never sees a button telling them to go get it.
+private struct EnableJITButton: View {
+    @ObservedObject private var jit = JITStatus.shared
+
+    var body: some View {
+        if !jit.isAvailable {
+            EnableJITControl()
+        }
+    }
+}
+
+private struct EnableJITControl: View {
+    @Environment(\.openURL) private var openURL
+    @State private var failedProvider: JITProvider?
+
+    private var providers: [JITProvider] { JITProvider.supported }
+
+    var body: some View {
+        Group {
+            if providers.count == 1, let only = providers.first {
+                Button { enable(only) } label: { label }
+                    .accessibilityHint("Enables JIT for touchHLE using \(only.displayName)")
+            } else {
+                Menu {
+                    ForEach(providers) { provider in
+                        Button("Using \(provider.displayName)") { enable(provider) }
+                    }
+                } label: {
+                    label
+                }
+                .accessibilityHint("Chooses how to enable JIT for touchHLE")
+            }
+        }
+        .alert(
+            "\(failedProvider?.displayName ?? "JIT") Not Available",
+            isPresented: Binding(
+                get: { failedProvider != nil },
+                set: { if !$0 { failedProvider = nil } }
+            )
+        ) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("Install and configure StikDebug, then try again. LocalDevVPN must be connected.")
+            Text(failedProvider?.unavailableMessage ?? "")
+        }
+    }
+
+    private var label: some View {
+        Label("Enable JIT", systemImage: "bolt.fill")
+    }
+
+    private func enable(_ provider: JITProvider) {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier,
+              let url = provider.url(bundleIdentifier: bundleIdentifier)
+        else {
+            failedProvider = provider
+            return
+        }
+
+        openURL(url) { accepted in
+            if !accepted {
+                failedProvider = provider
+            }
         }
     }
 }
@@ -840,7 +1170,7 @@ private struct SettingsView: View {
     @AppStorage("analogTilt") private var analogTilt = true
 
     var body: some View {
-        NavigationStack {
+        NavigationContainer {
             Form {
                 Section("Display") {
                     Picker("Resolution Scale", selection: $scaleHack) {
@@ -869,13 +1199,7 @@ private struct SettingsView: View {
                     Toggle("Analog Sticks Control Tilt", isOn: $analogTilt)
                 }
 
-                Section {
-                    EnableJITButton()
-                } header: {
-                    Text("JIT")
-                } footer: {
-                    Text("JIT must be enabled again whenever touchHLE starts as a new app process.")
-                }
+                JITSettingsSection()
 
                 Section("Advanced") {
                     NavigationLink {
@@ -900,6 +1224,79 @@ private struct SettingsView: View {
                 }
             }
         }
+    }
+}
+
+private struct JITSettingsSection: View {
+    @ObservedObject private var jit = JITStatus.shared
+    @AppStorage("autoEnableJIT") private var autoEnableJIT = true
+
+    var body: some View {
+        Section {
+            HStack {
+                Text("Status")
+                Spacer()
+                Text(statusText)
+                    .foregroundStyle(jit.isAvailable ? .green : .red)
+            }
+            .accessibilityElement(children: .combine)
+
+            if !jit.isPermanent {
+                Toggle("Enable Automatically on Launch", isOn: $autoEnableJIT)
+            }
+
+            EnableJITButton()
+
+            Button {
+                jit.refresh()
+            } label: {
+                Label("Re-check Now", systemImage: "arrow.clockwise")
+            }
+        } header: {
+            Text("JIT")
+        } footer: {
+            Text(footerText)
+        }
+        .onAppear { jit.refresh() }
+
+        Section {
+            ForEach(jit.diagnostics, id: \.0) { name, value in
+                HStack {
+                    Text(name)
+                    Spacer()
+                    Text(value)
+                        .foregroundStyle(.secondary)
+                        .font(.callout.monospaced())
+                }
+                .accessibilityElement(children: .combine)
+            }
+        } header: {
+            Text("JIT Diagnostics")
+        } footer: {
+            Text("Raw signals behind the verdict above. Include these when reporting that JIT will not turn on. They are also written to touchhle-host.log.")
+        }
+    }
+
+    private var statusText: String {
+        guard jit.isAvailable else { return "Not enabled" }
+        return jit.isPermanent ? "Enabled (entitlement)" : "Enabled (debugger)"
+    }
+
+    private var footerText: String {
+        if jit.isPermanent {
+            return """
+                This install carries the dynamic-codesigning entitlement, so JIT is \
+                always on and survives relaunches. No extra setup is needed.
+                """
+        }
+        if jit.isAvailable {
+            return """
+                JIT was granted by an attached debugger. It must be enabled again \
+                whenever touchHLE starts as a new app process, which the setting \
+                above does for you by handing off to TrollStore on launch.
+                """
+        }
+        return JITStatus.unavailableMessage
     }
 }
 
@@ -938,7 +1335,7 @@ private struct AboutView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationContainer {
             List {
                 Section {
                     VStack(spacing: 14) {
@@ -948,7 +1345,8 @@ private struct AboutView: View {
                                     .resizable()
                                     .scaledToFill()
                             } else {
-                                Image(systemName: "iphone.gen3")
+                                // iphone.gen3 is SF Symbols 4 (iOS 16+).
+                                Image(systemName: iOS16OrLater ? "iphone.gen3" : "iphone")
                                     .font(.system(size: 42, weight: .medium))
                                     .foregroundStyle(.blue)
                             }

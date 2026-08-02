@@ -10,10 +10,11 @@ This fork is not an official touchHLE release, is not endorsed by the upstream p
 | --- | --- |
 | Port version | 0.1.0 |
 | touchHLE base | 0.2.3 development line (`6bce4119`) |
-| Minimum target | iOS 17.4 |
+| Minimum target | iOS 15.0 |
 | Tested environment | iPhone 16 Pro running iOS 27 beta 4 |
 | CPU backend | Dynarmic |
 | JIT | Required whenever the port starts as a new process |
+| JIT providers | TrollStore (iOS 14-17.0), StikDebug (iOS 17.4+) |
 | Games | Not included; decrypted 32-bit IPAs are required |
 
 The native port currently provides:
@@ -23,7 +24,7 @@ The native port currently provides:
 - Persistent settings and per-game save folders.
 - Guest-aware portrait and landscape launch handling.
 - A red in-game exit control that returns to the library.
-- A StikDebug JIT shortcut.
+- Automatic JIT detection, with one-tap shortcuts to TrollStore or StikDebug when it is missing.
 - An optional FPS counter under **Settings → Advanced → Developer Tools**.
 
 ## Screenshots
@@ -43,7 +44,7 @@ Imported titles shown in screenshots are not all compatibility claims.
 
 ## Device And Game Testing
 
-The port has been personally tested on an **iPhone 16 Pro running iOS 27 beta 4**. Its deployment target is iOS 17.4, and it is intended to work on other modern iPhones and supported iOS versions, but those combinations have not all been verified yet.
+The port has been personally tested on an **iPhone 16 Pro running iOS 27 beta 4**. Its deployment target is iOS 15.0 so that TrollStore devices are covered, and it is intended to work on other iPhones and supported iOS versions, but those combinations have not all been verified yet. iOS 15 and 16 in particular are built for but not yet tested on hardware.
 
 Confirmed on that device:
 
@@ -59,7 +60,8 @@ The Sims Medieval is a planned compatibility target, not a currently working tit
 
 - JIT is required. This fork does not yet contain a no-JIT ARM interpreter.
 - The touchHLE compatibility database describes touchHLE generally, not guaranteed iOS-host behavior.
-- Device and iOS-version coverage is still limited.
+- Device and iOS-version coverage is still limited. iOS 15 and 16 are supported by the build but have not been verified on hardware.
+- Permanent JIT via `dynamic-codesigning` is limited to A11 and older devices. A12+ must re-enable JIT on every launch.
 - Some games need touchHLE compatibility work even when the port itself is functioning.
 - This is an early test build, not an App Store release.
 
@@ -73,7 +75,18 @@ Thanks also to Reddit user [u/WorriedEquipment2241](https://www.reddit.com/user/
 
 The public IPA must remain unsigned. It contains no Apple ID, certificate, provisioning profile, development team, device identifier, games, or saves. Your chosen install method signs it locally with your own Apple account.
 
-### Option A: AltStore Classic
+### Option A: TrollStore
+
+Best option if your device supports it (iOS 14.0-16.6.1, 16.7 RC, or 17.0). The install is permanent, needs no Apple ID, and never expires.
+
+1. Install [TrollStore](https://github.com/opa334/TrollStore) 2.0.12 or newer.
+2. Download `touchHLE-iOS-trollstore.ipa` from this fork's GitHub Releases.
+3. Open it with TrollStore and install.
+4. Complete the [JIT setup](#trollstore) before starting a game.
+
+Use the `-trollstore` IPA rather than the plain unsigned one. TrollStore keeps whatever entitlements a binary already declares but does not add any, and the plain IPA is entirely unsigned, so it would arrive with no `get-task-allow` and TrollStore's **Enable JIT** option would never appear.
+
+### Option B: AltStore Classic
 
 This is the simplest public installation route.
 
@@ -87,7 +100,7 @@ With a free Apple account, Apple limits Personal Team profiles to seven days and
 
 A paid Apple Developer Program account provides longer-lived development signing and avoids the free Personal Team's weekly reprovisioning limit. It does **not** remove the JIT requirement.
 
-### Option B: Build And Install With Xcode
+### Option C: Build And Install With Xcode
 
 This works with either a free Personal Team or a paid developer account.
 
@@ -111,6 +124,36 @@ Never commit or upload Xcode's signed app, provisioning profile, certificate, te
 ## Enable JIT
 
 Dynarmic requires executable memory, so installing the app is not enough by itself. JIT must be enabled again whenever touchHLE starts as a new process. JIT normally remains available until the app is force-quit or removed from memory.
+
+touchHLE checks for JIT at launch and shows the result under **Settings → JIT**. The **bolt** button only appears when JIT is missing, and it offers whichever providers can work on the running iOS version. Starting a game without JIT warns but still lets you continue, so a wrong detection can never lock you out.
+
+Detection reads the `CS_DEBUGGED` process flag via `csops`, the same approach UTM and PPSSPP use, plus a check for the `dynamic-codesigning` entitlement. Note that probing with `mmap(PROT_WRITE | PROT_EXEC)` does **not** work here: per `mmap(2)`, iOS returns a writable-but-non-executable mapping instead of failing when `MAP_JIT` is absent, so such a probe reports success even with no JIT at all.
+
+### TrollStore
+
+TrollStore is the only route on iOS 15 and 16, because StikDebug needs iOS 17.4 or newer.
+
+1. Install `touchHLE-iOS-trollstore.ipa` through TrollStore. It is fakesigned with `get-task-allow`, which is what TrollStore's JIT feature requires.
+2. Open TrollStore, go to **Settings**, and turn on the **URL scheme**. This is what lets touchHLE hand off to TrollStore.
+3. Open touchHLE from the home screen. It hands off to TrollStore automatically, which enables JIT and bounces straight back.
+
+Debugger-granted JIT only lasts for the life of the process, so it has to be re-established on every cold start. touchHLE does that for you: on launch, if JIT is missing, it opens TrollStore's `enable-jit` URL scheme and returns. You will see TrollStore flash up briefly. This runs at most once per launch, so a failed handoff cannot bounce you back and forth.
+
+Turn it off under **Settings → JIT → Enable Automatically on Launch**, in which case use the **bolt** button, or long-press touchHLE in TrollStore and pick **Open with JIT**.
+
+TrollStore requires 2.0.12 or newer for this, and supports iOS 14.0 through 16.6.1, 16.7 RC, and 17.0.
+
+#### Permanent JIT (A11 and older only)
+
+On A11 and older devices — iPhone X, iPhone 8, and earlier — the `dynamic-codesigning` entitlement makes JIT permanent, so it survives relaunches and no bolt button is ever needed:
+
+```sh
+sh platform/ios/scripts/package-ipa.sh --trollstore-permanent-jit
+```
+
+This requires `ldid` (`brew install ldid`) and produces `dist/touchHLE-iOS-trollstore.ipa`.
+
+**Do not install that IPA on an A12 or newer device.** iOS 15 and later ban the three entitlements related to running unsigned code — `com.apple.private.cs.debugger`, `dynamic-codesigning`, and `com.apple.private.skip-library-validation` — on A12+ chips. They cannot be granted without a PPL bypass, and an app carrying them **crashes on launch**. Use the default IPA and per-launch JIT there.
 
 ### StikDebug And LocalDevVPN
 
@@ -249,7 +292,8 @@ export DEVELOPER_DIR="/Applications/Xcode-beta.app/Contents/Developer"
 
 ```sh
 sh platform/ios/scripts/build-host.sh iphoneos Release
-sh platform/ios/scripts/package-ipa.sh
+sh platform/ios/scripts/package-ipa.sh              # AltStore / Sideloadly / Xcode
+sh platform/ios/scripts/package-ipa.sh --trollstore # TrollStore
 ```
 
 The outputs are:
@@ -257,10 +301,27 @@ The outputs are:
 ```text
 build/host-iphoneos/Build/Products/Release-iphoneos/touchHLE.app
 dist/touchHLE-iOS-unsigned.ipa
-dist/touchHLE-iOS-unsigned.ipa.sha256
+dist/touchHLE-iOS-trollstore.ipa
 ```
 
-The packaging script refuses to package a signed app.
+Each IPA is written with a matching `.sha256`. The packaging script refuses to package an already-signed app.
+
+`--trollstore` fakesigns the binary with `ldid` using `Config/TouchHLEHost-TrollStore.entitlements`, so it needs `brew install ldid`. The plain unsigned IPA carries no entitlements, which is correct for AltStore and Xcode because they apply their own.
+
+Those TrollStore entitlements are deliberately not in the Xcode build's `Config/TouchHLEHost.entitlements`: the two memory entitlements need provisioning-profile support that a free Apple account does not have, so including them would break AltStore and Xcode signing. TrollStore grants them unconditionally.
+
+### Memory Entitlements
+
+touchHLE maps the guest address space as one flat 4 GiB region (`type Bytes = [u8; 1 << 32]` in `src/mem.rs`). Recent devices have enough virtual address space for that by default. Older ones do not, and the mapping fails with `ENOMEM` before the guest app starts — even as a `PROT_NONE` reservation, because the limit is on address space rather than on backing. The symptom is a black screen on game launch.
+
+The TrollStore IPA therefore ships:
+
+| Entitlement | Why |
+| --- | --- |
+| `com.apple.developer.kernel.extended-virtual-addressing` | iOS 14+. Puts the kernel in "jumbo mode" and grants the full 64-bit address space, which is what lets the 4 GiB mapping succeed on A12 and older hardware. |
+| `com.apple.developer.kernel.increased-memory-limit` | Raises the Jetsam footprint limit, so a large guest app is not killed partway through. |
+
+`src/mem/host.rs` also degrades gracefully if the mapping still fails, trying `MAP_NORESERVE` and then a `PROT_NONE` reservation widened with `mprotect`, logging whichever succeeds.
 
 ### Simulator Build
 

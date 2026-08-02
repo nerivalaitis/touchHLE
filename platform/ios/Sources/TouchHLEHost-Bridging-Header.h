@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -22,3 +23,21 @@ int32_t touchhle_ios_launch_game(
 
 void touchhle_ios_request_exit(void);
 float touchhle_ios_current_fps(void);
+
+bool touchhle_ios_jit_available(void);
+bool touchhle_ios_jit_is_from_debugger(void);
+
+/// Raw signals behind the JIT verdict, so a wrong verdict can be diagnosed on
+/// device instead of guessed at.
+typedef struct {
+    int csops_result;
+    int csops_errno;
+    unsigned int cs_flags;
+    bool cs_debugged;
+    bool has_dynamic_codesigning;
+    bool mmap_rwx_ok;
+    bool mprotect_exec_ok;
+} TouchHLEJITDiagnostics;
+
+void touchhle_ios_jit_diagnostics(TouchHLEJITDiagnostics *out);
+void touchhle_ios_log_jit_status(const char *context);
