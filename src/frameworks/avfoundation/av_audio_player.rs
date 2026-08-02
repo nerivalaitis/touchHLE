@@ -96,12 +96,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_id = Some(audio_file_id);
     env.mem.free(tmp_afi_ptr.cast());
     if status != 0 {
+        // Worth saying out loud: the app gets nil back, and a caller that does
+        // not check for that will dereference it and die somewhere unrelated,
+        // with nothing in the log connecting the crash to this file.
+        log!(
+            "Warning: AVAudioPlayer couldn't open {:?} (AudioFileOpenURL status {}), \
+             returning nil.",
+            path_str,
+            status
+        );
         if !out_error.is_null() {
             let domain = ns_string::get_static_str(env, NSOSStatusErrorDomain);
             let error = msg_class![env; NSError alloc];
             let error = msg![env; error initWithDomain:domain code:status userInfo:nil];
             autorelease(env, error);
             env.mem.write(out_error, error);
+        } else {
+            log!(
+                "Warning: the app passed a NULL error pointer, so it has no way to \
+                 find out why loading failed."
+            );
         }
         release(env, this);
         return nil;

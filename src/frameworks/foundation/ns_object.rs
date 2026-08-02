@@ -148,10 +148,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     this == other
 }
 
-// TODO: Instance description and debugDescription.
-// This is not hard to add, but before adding a fallback implementation of it,
-// we should make sure all the Foundation classes' overrides of it are there,
-// to prevent weird behavior.
+// The Foundation classes whose descriptions carry real content - NSString,
+// NSNumber/NSValue, NSArray, NSDictionary, NSDate, NSURL - all override these,
+// so a generic fallback no longer risks papering over a missing one. Without
+// it, sending `description` to anything else aborts the app: Sword of Fargoal
+// does exactly that to an NSAutoreleasePool while loading music.
+- (id)description {
+    // Apple's NSObject formats this as "<ClassName: 0xADDRESS>".
+    let class = ObjC::read_isa(this, &env.mem);
+    let name = env.objc.get_class_name(class).to_string();
+    let string = from_rust_string(env, format!("<{}: {:?}>", name, this));
+    autorelease(env, string)
+}
+
+- (id)debugDescription {
+    msg![env; this description]
+}
+
 // TODO: localized description methods also? (not sure if NSObject has them)
 
 // Helper for NSCopying

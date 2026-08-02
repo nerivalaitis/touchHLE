@@ -184,6 +184,17 @@ private final class JITStatus: ObservableObject {
     }
 }
 
+/// Values stored in the "orientation" setting. These are the user's choice, not
+/// the guest orientation codes the emulator takes - `launchOrientation` maps
+/// between them.
+private enum OrientationSetting {
+    static let automatic = 0
+    static let landscapeLeft = 1
+    static let landscapeRight = 2
+    // 3 is skipped on purpose: the emulator maps that to --upside-down.
+    static let portrait = 4
+}
+
 private struct GameFile: Identifiable {
     let url: URL
     let displayName: String
@@ -216,17 +227,31 @@ private struct GameFile: Identifiable {
     ) -> Int {
         let supportsPortrait = orientationCapabilities & 1 != 0
         let supportsLandscape = orientationCapabilities & 2 != 0
+        // An explicit landscape or portrait choice overrides what the device is
+        // doing, but never what a single-orientation bundle declares.
+        let isExplicitLandscape = orientation == OrientationSetting.landscapeLeft
+            || orientation == OrientationSetting.landscapeRight
+        let isExplicitPortrait = orientation == OrientationSetting.portrait
+
         if supportsPortrait && !supportsLandscape {
             return 0
         }
         if supportsLandscape && !supportsPortrait {
-            if orientation == 1 || orientation == 2 {
+            if isExplicitLandscape {
                 return orientation
+            }
+            // Some games advertise landscape but render portrait anyway -
+            // Sword of Fargoal builds a 320x480 view - so allow forcing it.
+            if isExplicitPortrait {
+                return 0
             }
             return currentInterfaceOrientation == .landscapeRight ? 2 : 1
         }
-        if orientation == 1 || orientation == 2 {
+        if isExplicitLandscape {
             return orientation
+        }
+        if isExplicitPortrait {
+            return 0
         }
         switch currentInterfaceOrientation {
         case .landscapeLeft:
@@ -1223,9 +1248,10 @@ private struct SettingsView: View {
                     }
 
                     Picker("Starting Orientation", selection: $orientation) {
-                        Text("Automatic").tag(0)
-                        Text("Landscape Left").tag(1)
-                        Text("Landscape Right").tag(2)
+                        Text("Automatic").tag(OrientationSetting.automatic)
+                        Text("Portrait").tag(OrientationSetting.portrait)
+                        Text("Landscape Left").tag(OrientationSetting.landscapeLeft)
+                        Text("Landscape Right").tag(OrientationSetting.landscapeRight)
                     }
                 }
 

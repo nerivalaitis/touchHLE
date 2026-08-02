@@ -312,19 +312,44 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     std::mem::drop(gles);
 
-    let Some(&drawable) = env
+    let drawable = env
         .objc
         .borrow::<EAGLContextHostObject>(this)
         .renderbuffer_drawable_bindings
         .borrow()
-        .get(&renderbuffer) else {
+        .get(&renderbuffer)
+        .copied();
+
+    let Some(drawable) = drawable else {
+        // Nothing gets presented here. If it happens every frame the screen
+        // stays black while the FPS counter keeps climbing, which is very
+        // hard to tell apart from a bug elsewhere - so say it out loud once
+        // rather than only under log_dbg.
+        {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log!(
+                    "Warning: renderbuffer {:?} has no drawable bound to it, so nothing \
+                     can be presented and the screen will stay black. \
+                     [this log will only be shown once]",
+                    renderbuffer
+                );
+            });
+        }
         log_dbg!("Can't present a renderbuffer {:?} not bound to a drawable!", renderbuffer);
+        // Still honour the frame limiter. Returning early without it lets the
+        // guest spin as fast as it can, which is why the FPS counter reads
+        // above the display refresh rate when this path is taken.
+        if let Some(sleep_for) = sleep_for {
+            env.sleep(sleep_for);
+        }
         return false;
     };
 
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
     if drawable == fullscreen_layer {
+        log_once!("Presenting via the fullscreen-layer fast path.");
         log_dbg!(
             "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} directly (fast path).",
             drawable,
@@ -357,6 +382,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // copied back to system RAM, and then will have to be copied to VRAM
         // again during composition. find_fullscreen_eagl_layer() exists to
         // avoid this.
+        log_once!("Presenting via the composition slow path (no fullscreen layer).");
         log_dbg!(
             "There is no fullscreen layer, presenting renderbuffer {:?} to layer {:?} by copying to RAM (slow path).",
             renderbuffer,
