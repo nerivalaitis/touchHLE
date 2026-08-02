@@ -155,6 +155,33 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
+
+    // On iOS, SDL2 draws into a framebuffer object of its own rather than 0,
+    // and it recreates that object whenever the window leaves and re-enters
+    // fullscreen - which is precisely what rotating the device does. The value
+    // cached at window creation can therefore be stale by now, and compositing
+    // into a stale framebuffer produces a black screen. Ask for the current one
+    // while it is still bound, before the render-to-texture setup below
+    // replaces the binding.
+    let host_framebuffer = if cfg!(target_os = "ios") {
+        let mut current = 0;
+        unsafe {
+            gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut current);
+        }
+        let current = current as u32;
+        if current != host_framebuffer {
+            log!(
+                "Note: host framebuffer changed since window creation ({} -> {}); \
+                 compositing into the current one.",
+                host_framebuffer,
+                current
+            );
+        }
+        current
+    } else {
+        host_framebuffer
+    };
+
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
     // rotating the screen and drawing the virtual cursor.
@@ -375,6 +402,21 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     unsafe {
         gles.BindTexture(gles11::TEXTURE_2D, texture);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, host_framebuffer);
+        {
+            // Composition only runs for apps that lack a fullscreen CAEAGLLayer,
+            // so it is easy for it to be broken without anything noticing.
+            // Record that it ran, and with what, exactly once.
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            let (viewport, _, _) = present_frame_args;
+            LOGGED.call_once(|| {
+                log!(
+                    "Compositing to host framebuffer {} with texture {}, viewport {:?}.",
+                    host_framebuffer,
+                    texture,
+                    viewport
+                );
+            });
+        }
         present_frame(
             gles.as_mut(),
             present_frame_args.0,
