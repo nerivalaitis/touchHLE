@@ -86,7 +86,10 @@ fn AudioUnitSetProperty(
     in_data: ConstVoidPtr,
     in_data_size: u32,
 ) -> OSStatus {
-    assert!(in_element == 0);
+    // For kAudioOutputUnitProperty_EnableIO the element selects the bus
+    // (0 = output, 1 = input), and apps enabling microphone input conventionally
+    // pass element 1. Every other property handled here is element 0 only.
+    assert!(in_element == 0 || in_id == kAudioOutputUnitProperty_EnableIO);
 
     let host_object = audio_components::State::get(&mut env.framework_state)
         .audio_component_instances
@@ -117,11 +120,34 @@ fn AudioUnitSetProperty(
             log_dbg!("AudioUnitSetProperty({:?}, kAudioUnitProperty_StreamFormat, {:?}, {:?}, {:?}, {:?}) -> {:?}", in_unit, in_scope, in_element, stream_format, in_data_size, result);
         }
         kAudioOutputUnitProperty_EnableIO => {
-            assert_eq!(in_scope, kAudioUnitScope_Output);
             assert_eq!(in_data_size, guest_size_of::<u32>());
             let enabled = env.mem.read(in_data.cast::<u32>());
-            // Output is enabled by default.
-            assert_eq!(enabled, 1);
+            // Setting up a RemoteIO unit normally means toggling both buses,
+            // so neither the scope nor the value can be assumed. Nothing here
+            // is worth aborting the app over.
+            match in_scope {
+                kAudioUnitScope_Output => {
+                    // Output is enabled by default.
+                    if enabled != 1 {
+                        log!(
+                            "TODO: app disabled Audio Unit output I/O, which is unimplemented; \
+                             audio will keep playing"
+                        );
+                    }
+                }
+                kAudioUnitScope_Input => {
+                    // touchHLE has no audio input. Apps usually disable this
+                    // bus, which matches our behaviour anyway; enabling it is
+                    // a request we cannot honour.
+                    if enabled != 0 {
+                        log!(
+                            "TODO: app enabled Audio Unit input I/O (audio recording), \
+                             which is unimplemented; no input will be captured"
+                        );
+                    }
+                }
+                _ => unimplemented!("in_scope {}", in_scope),
+            }
             result = 0;
             log_dbg!("AudioUnitSetProperty({:?}, kAudioOutputUnitProperty_EnableIO, {:?}, {:?}, {:?}, {:?}) -> {:?}", in_unit, in_scope, in_element, enabled, in_data_size, result);
         }

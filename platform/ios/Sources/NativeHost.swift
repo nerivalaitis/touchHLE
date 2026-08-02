@@ -193,6 +193,23 @@ private struct GameFile: Identifiable {
 
     var id: String { url.path }
 
+    /// Every orientation the guest declares support for. The controls overlay
+    /// sits above SDL's window, so its root view controller is what iOS asks
+    /// about rotation. Pinning it to the launch orientation blocks any rotation
+    /// the guest performs later, which SDL then rejects with "Screen
+    /// orientation does not match display mode size".
+    var supportedOrientationMask: UIInterfaceOrientationMask {
+        var mask: UIInterfaceOrientationMask = []
+        if orientationCapabilities & 1 != 0 {
+            mask.insert(.portrait)
+        }
+        if orientationCapabilities & 2 != 0 {
+            mask.insert(.landscapeLeft)
+            mask.insert(.landscapeRight)
+        }
+        return mask.isEmpty ? .portrait : mask
+    }
+
     func launchOrientation(
         override orientation: Int,
         currentInterfaceOrientation: UIInterfaceOrientation
@@ -306,7 +323,8 @@ private final class GameLibrary: ObservableObject {
             )
             TouchHLENativeHost.hideHostWindow()
             TouchHLENativeHost.prepareGameControls(
-                launchOrientation: launchOrientation
+                launchOrientation: launchOrientation,
+                guestOrientations: game.supportedOrientationMask
             ) { [weak self] in
                 guard let self else { return }
                 let result = game.url.path.withCString { path in
@@ -503,6 +521,17 @@ private final class GameControlsViewController: UIViewController {
         allowedOrientations
     }
 
+    /// Re-ask UIKit which orientations are permitted after changing
+    /// `allowedOrientations`. `setNeedsUpdateOfSupportedInterfaceOrientations`
+    /// is iOS 16+, so iOS 15 falls back to the older equivalent.
+    func setNeedsOrientationUpdate() {
+        if #available(iOS 16.0, *) {
+            setNeedsUpdateOfSupportedInterfaceOrientations()
+        } else {
+            UIViewController.attemptRotationToDeviceOrientation()
+        }
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .clear
@@ -586,10 +615,12 @@ final class TouchHLENativeHost: NSObject {
     @MainActor
     static func prepareGameControls(
         launchOrientation: Int,
+        guestOrientations: UIInterfaceOrientationMask,
         completion: @escaping @MainActor () -> Void
     ) {
         shared.presentGameControls(
             launchOrientation: launchOrientation,
+            guestOrientations: guestOrientations,
             completion: completion
         )
     }
@@ -617,6 +648,7 @@ final class TouchHLENativeHost: NSObject {
     @MainActor
     private func presentGameControls(
         launchOrientation: Int,
+        guestOrientations: UIInterfaceOrientationMask,
         completion: @escaping @MainActor () -> Void
     ) {
         guard gameControlsWindow == nil,
@@ -660,6 +692,11 @@ final class TouchHLENativeHost: NSObject {
         waitForGameSurface(
             windowScene: windowScene,
             orientationMask: launchOrientationMask,
+            // Once the launch orientation has settled, widen to everything the
+            // guest supports so it can rotate itself later. Widening up front
+            // would let iOS immediately follow the physical device orientation
+            // and defeat the forced launch orientation.
+            settledOrientations: launchOrientationMask.union(guestOrientations),
             expectsLandscape: launchOrientation == 1 || launchOrientation == 2,
             remainingAttempts: 30,
             completion: completion
@@ -670,6 +707,7 @@ final class TouchHLENativeHost: NSObject {
     private func waitForGameSurface(
         windowScene: UIWindowScene,
         orientationMask: UIInterfaceOrientationMask,
+        settledOrientations: UIInterfaceOrientationMask,
         expectsLandscape: Bool,
         remainingAttempts: Int,
         completion: @escaping @MainActor () -> Void
@@ -686,12 +724,15 @@ final class TouchHLENativeHost: NSObject {
             gameControlsWindow?.frame = bounds
             gameControlsWindow?.layoutIfNeeded()
             if let viewController = gameControlsWindow?.rootViewController as? GameControlsViewController {
-                viewController.allowedOrientations = orientationMask
                 touchHLEApplyOrientation(
                     orientationMask,
                     viewController: viewController,
                     scene: nil
                 )
+                // Now that the launch orientation has taken effect, stop
+                // pinning it so a guest-initiated rotation is not blocked.
+                viewController.allowedOrientations = settledOrientations
+                viewController.setNeedsOrientationUpdate()
             }
             print(
                 "touchHLE game surface ready: orientation=\(windowScene.interfaceOrientation.rawValue) " +
@@ -707,6 +748,7 @@ final class TouchHLENativeHost: NSObject {
             self?.waitForGameSurface(
                 windowScene: windowScene,
                 orientationMask: orientationMask,
+                settledOrientations: settledOrientations,
                 expectsLandscape: expectsLandscape,
                 remainingAttempts: remainingAttempts - 1,
                 completion: completion
